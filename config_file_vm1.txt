@@ -1,2 +1,0 @@
-vm_exec_slice_in_instructions=100
-vm_binary=instructions_vm1.txt
