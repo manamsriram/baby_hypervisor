@@ -97,28 +97,31 @@ bool parse_vm_config(const std::string& fname, VMConfig& vm) {
 int main(int argc, char *argv[]) {
     // Parse all -v <assembly_config_file> [-s] arguments
     std::vector<VMConfig> vms;
+    VMConfig pending;
     for (int i = 1; i < argc;) {
-        if (std::string(argv[i]) == "-v" && (i+1 < argc)) {
-            VMConfig vm;
-            vm.assembly_file = argv[i+1];
-            if (!parse_vm_config(vm.assembly_file, vm)) {
-                std::cerr << "Failed to open config/assembly file: " << vm.assembly_file << std::endl;
+        if (std::string(argv[i])=="-v" && (i+1) < argc) {
+            if (!pending.assembly_file.empty()) {
+                vms.push_back(pending);
+                pending = VMConfig{};
+            }
+            pending.assembly_file = std::string(argv[i+1]);
+            if (!parse_vm_config(pending.assembly_file, pending)) {
+                std::cerr << "Failed to open config/assembly file: " << pending.assembly_file << std::endl;
                 return 1;
             }
-            i += 2;
-            // Only set load_snapshot if -s argument directly follows this -v pair
-            if (i < argc && std::string(argv[i]) == "-s" && (i+1 < argc)) {
-                vm.load_snapshot = true;
-                vm.snapshot_file = argv[i+1]; // Assign snapshot filename from command line argument!
-                i += 2;
-            }
-            vms.push_back(vm);
+            i = i+2;
+        } else if (std::string(argv[i])=="-s" && (i+1) < argc) {
+            pending.snapshot_file = std::string(argv[i+1]);
+            pending.load_snapshot = true;
+            i = i+2;
         } else {
             std::cerr << "Usage: myvmm -v <assembly_file_vm1> [-s <snapshot_file_vm1>] -v <assembly_file_vm2> ...\n";
             return 1;
         }
     }
-
+    if(!pending.assembly_file.empty()) {
+        vms.push_back(pending);
+    }
 
     // Run each VM one by one
     for (size_t v = 0; v < vms.size(); ++v) {
