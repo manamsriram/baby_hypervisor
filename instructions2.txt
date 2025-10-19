@@ -1,0 +1,6 @@
+li $1,1
+xor $10,$6,$8
+or $11,$4,100
+sll $12,$7,10
+srl $13,$8,10
+DUMP_PROCESSOR_STATE
