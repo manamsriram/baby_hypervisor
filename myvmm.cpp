@@ -3,12 +3,17 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include <algorithm>
 #include <cstdint>
+#include <cstring>
 
+// ADD THESE HEADERS FOR NETWORKING
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
+// Configurable number of registers
 #define NUM_REGISTERS 32
-
-// Mapping a register index to its symbolic MIPS name for reference/printing
 const char *reg_names[NUM_REGISTERS] = {
     "$zero", "$at", "$v0", "$v1", "$a0", "$a1", "$a2", "$a3",
     "$t0", "$t1", "$t2", "$t3", "$t4", "$t5", "$t6", "$t7",
@@ -16,43 +21,84 @@ const char *reg_names[NUM_REGISTERS] = {
     "$t8", "$t9", "$k0", "$k1", "$gp", "$sp", "$fp", "$ra"
 };
 
-// Holds all configuration data for a single VM instance
 struct VMConfig {
-    std::string assembly_file;    // The VM's config file path
-    std::string instruction_file; // Parsed from vm_binary=... in config/assembly
-    std::string snapshot_file;    // Snapshot file associated with this VM (from config or CLI)
-    bool load_snapshot = false;   // True if snapshot should be loaded on startup
-    int slice = 100;              // Number of instructions to execute (from config, default 100)
+    std::string assembly_file;
+    std::string instruction_file;
+    std::string snapshot_file;
+    bool load_snapshot = false;
+    int slice = 100;
 };
 
-// Holds the runtime VM state to be saved/restored in snapshots
+// Full processor state (registers + PC)
 struct VMState {
-    int32_t reg[NUM_REGISTERS];   // All 32 integer registers
-    uint32_t pc;                  // The program counter (next instruction to execute)
+    int32_t reg[NUM_REGISTERS];
+    uint32_t pc;
 };
 
-// Returns register index for a given string ($n or symbolic name like $a0)
+// Networking function: waits for migration transfer and saves to file
+void receive_snapshot(int port, const std::string& output_file) {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port);
+
+    bind(server_fd, (struct sockaddr*)&address, sizeof(address));
+    listen(server_fd, 1);
+
+    std::cout << "[migration] Waiting for VM state on port " << port << "\n";
+    int client_socket = accept(server_fd, nullptr, nullptr);
+    std::ofstream fout(output_file, std::ios::binary);
+    char buffer[4096];
+    ssize_t bytes;
+    while ((bytes = read(client_socket, buffer, sizeof(buffer))) > 0) {
+        fout.write(buffer, bytes);
+    }
+    fout.close();
+    close(client_socket);
+    close(server_fd);
+    std::cout << "[migration] Snapshot received as " << output_file << "\n";
+}
+
+// Networking function: sends a snapshot to given ip:port
+void send_snapshot(const std::string& ip, int port, const std::string& snapshot_file) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    inet_pton(AF_INET, ip.c_str(), &server_addr.sin_addr);
+
+    std::cout << "[migration] Connecting to " << ip << ":" << port << "\n";
+    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        std::cerr << "[migration] Connection failed!\n";
+        return;
+    }
+    std::ifstream fin(snapshot_file, std::ios::binary);
+    char buffer[4096];
+    while (fin.read(buffer, sizeof(buffer)) || fin.gcount() > 0) {
+        send(sock, buffer, fin.gcount(), 0);
+    }
+    fin.close();
+    close(sock);
+    std::cout << "[migration] Migration sent!\n";
+}
+
+// Register name to index
 int reg_index(const std::string &r) {
     if (r.empty()) return -1;
-    // Check for $n format (e.g. $4)
     if (r[0] == '$' && r.length() > 1 && isdigit(r[1])) {
         try { return std::stoi(r.substr(1)); } catch (...) {}
     }
-    // Check for symbolic MIPS name (e.g. $s5)
     for (int i = 0; i < NUM_REGISTERS; ++i)
         if (r == reg_names[i]) return i;
     return -1;
 }
 
-// Print all 32 registers ($r0 to $r31). Use reg_names if you want symbolic names.
 void dump_processor_state(const int32_t reg[NUM_REGISTERS]) {
     for (int i = 0; i < NUM_REGISTERS; ++i)
         std::cout << "$r" << i << "=" << reg[i] << std::endl;
-    // Use reg_names[i] if you want symbolic names
-    // std::cout << reg_names[i] << "=" << reg[i] << std::endl;
 }
 
-// Save VM state (registers + PC) to a binary snapshot file
 bool save_snapshot(const VMState& state, const std::string& snapfile) {
     std::ofstream out(snapfile, std::ios::binary);
     if (!out) return false;
@@ -61,7 +107,6 @@ bool save_snapshot(const VMState& state, const std::string& snapfile) {
     return true;
 }
 
-// Restore VM state (registers + PC) from binary snapshot file
 bool load_snapshot(VMState& state, const std::string& snapfile) {
     std::ifstream in(snapfile, std::ios::binary);
     if (!in) return false;
@@ -70,32 +115,25 @@ bool load_snapshot(VMState& state, const std::string& snapfile) {
     return true;
 }
 
-// Parse the VM config/assembly file for keys like vm_binary, vm_snapshot, vm_exec_slice_in_instructions
 bool parse_vm_config(const std::string& fname, VMConfig& vm) {
     std::ifstream conf(fname);
     if (!conf) return false;
     std::string line;
     while (std::getline(conf, line)) {
-        // Remove comments
         size_t comment = line.find('#');
         if (comment != std::string::npos) line = line.substr(0, comment);
         size_t first = line.find_first_not_of(" \t\r\n");
         if (first == std::string::npos) continue;
         size_t last = line.find_last_not_of(" \t\r\n");
         line = line.substr(first, last - first + 1);
-
-        // Parse vm_binary setting: sets instruction file to run on this VM
         if (line.find("vm_binary") != std::string::npos) {
             vm.instruction_file = line.substr(line.find('=') + 1);
             vm.instruction_file.erase(0, vm.instruction_file.find_first_not_of(" \t"));
         }
-        // Parse vm_snapshot: sets default snapshot if present in config
         if (line.find("vm_snapshot") != std::string::npos) {
             vm.snapshot_file = line.substr(line.find('=') + 1);
             vm.snapshot_file.erase(0, vm.snapshot_file.find_first_not_of(" \t"));
-            // You could set vm.load_snapshot = true here if you want to always load from config snapshot
         }
-        // Parse how many instructions to execute before halting
         if (line.find("vm_exec_slice_in_instructions") != std::string::npos) {
             std::string val = line.substr(line.find('=') + 1);
             val.erase(0, val.find_first_not_of(" \t"));
@@ -105,15 +143,14 @@ bool parse_vm_config(const std::string& fname, VMConfig& vm) {
     return true;
 }
 
-// Entry point: parses CLI arguments, sets up config per VM, runs each VM one at a time
 int main(int argc, char *argv[]) {
-    std::vector<VMConfig> vms;    // List of all VMs to run this session
-    VMConfig pending;             // Will hold info for the VM currently being parsed
+    std::vector<VMConfig> vms;
+    VMConfig pending;
 
-    // Parse CLI arguments. Supports mixed -v and -s order, associates snapshot with most recent VM
+    // SUPPORTS: -v <file> -s <snapshot> -p <port> 
+    int migration_port = 0;
     for (int i = 1; i < argc;) {
         if (std::string(argv[i]) == "-v" && (i + 1) < argc) {
-            // If previous VM spec is complete, push it to list
             if (!pending.assembly_file.empty()) {
                 vms.push_back(pending);
                 pending = VMConfig{};
@@ -125,26 +162,34 @@ int main(int argc, char *argv[]) {
             }
             i += 2;
         } else if (std::string(argv[i]) == "-s" && (i + 1) < argc) {
-            // Associate this snapshot with current pending VM (overrides config snapshot)
             pending.snapshot_file = argv[i+1];
             pending.load_snapshot = true;
             i += 2;
+        } else if (std::string(argv[i]) == "-p" && (i + 1) < argc) {
+            migration_port = std::stoi(argv[i+1]);
+            i += 2;
         } else {
-            std::cerr << "Usage: myvmm [-s <snapshot_file>] -v <config_file> [...]" << std::endl;
+            std::cerr << "Usage: myvmm [-s SNAPSHOT] -v ASSYFILE [-p PORT]\n";
             return 1;
         }
     }
-    // Push last VM on CLI (if any) to VM set
     if (!pending.assembly_file.empty()) vms.push_back(pending);
 
-    // Run each VM one by one (could extend to parallel execution if desired)
-    for (size_t v = 0; v < vms.size(); ++v) {
-        std::cout << "====== VM #" << (v + 1) << " ======" << std::endl;
-        const auto& vm = vms[v];
-        VMState state = {};      // Reset registers and PC to default for each VM
-        int slice = vm.slice;    // How many instructions to execute, from config/CLI
+    // If -p (receiver mode): Listen for incoming migration before resuming VM
+    if (migration_port > 0) {
+        receive_snapshot(migration_port, "migrated_snapshot.bin");
+        if (vms.size() > 0) {
+            vms[0].snapshot_file = "migrated_snapshot.bin";
+            vms[0].load_snapshot = true;
+        }
+    }
 
-        // If requested, load snapshot file for initial VM state
+    for (size_t v = 0; v < vms.size(); ++v) {
+        std::cout << "====== VM #" << (v+1) << " ======" << std::endl;
+        const auto& vm = vms[v];
+        VMState state = {}; // Clear processor state
+
+        int slice = vm.slice;
         if (vm.load_snapshot && !vm.snapshot_file.empty()) {
             if (load_snapshot(state, vm.snapshot_file)) {
                 std::cout << "Loaded snapshot: " << vm.snapshot_file << std::endl;
@@ -152,8 +197,7 @@ int main(int argc, char *argv[]) {
                 std::cerr << "Failed to load snapshot: " << vm.snapshot_file << std::endl;
             }
         }
-        
-        // Load assembly/instruction file into memory for indexed access
+
         std::ifstream prog(vm.instruction_file);
         if (!prog) {
             std::cerr << "Cannot open instruction file: " << vm.instruction_file << std::endl;
@@ -172,21 +216,14 @@ int main(int argc, char *argv[]) {
         }
         prog.close();
 
-        uint32_t pc = state.pc;  // If restoring, start at saved PC; else start at 0
-        if(vm.load_snapshot) {
-            std::cout << "Loaded snapshot. Resuming at instruction #" << state.pc << " / total instructions = " << instructions.size() << std::endl;
-        }
+        uint32_t pc = state.pc;
         int instr_count = 0;
         while (pc < instructions.size() && instr_count < slice) {
-            // Optional debug: show instruction being executed
             std::cout << "Executing PC=" << pc << ": " << instructions[pc] << std::endl;
-
             std::istringstream iss(instructions[pc]);
             std::string instr;
             iss >> instr;
             if (instr.empty()) { pc++; continue; }
-
-            // Parse argument list from instruction line
             std::vector<std::string> args;
             std::string token, arg;
             std::getline(iss, token);
@@ -200,26 +237,40 @@ int main(int argc, char *argv[]) {
                     arg.clear();
                 if (!arg.empty()) args.push_back(arg);
             }
-
-            // Instruction handlers (add more for your ISA as needed)
-            if (instr == "DUMP_PROCESSOR_STATE") {
-                dump_processor_state(state.reg);
+            // MIGRATION HANDLER
+            if (instr == "MIGRATE" && args.size() == 1) {
+                size_t colon = args[0].find(':');
+                std::string ip = args[0].substr(0, colon);
+                int port = std::stoi(args[0].substr(colon+1));
+                std::string snapshot_file = "temp_migrate_snapshot.bin";
+                state.pc = pc + 1;
+                if (!save_snapshot(state, snapshot_file)) {
+                    std::cerr << "[migration] Could not create snapshot!\n";
+                    break;
+                }
+                send_snapshot(ip, port, snapshot_file);
+                std::cout << "[migration] VM migrated; stopping local execution.\n";
+                break; // Optional: stop VM after migration, or remove this line if you want to keep running
             }
+            // SNAPSHOT
             else if (instr == "SNAPSHOT" && args.size() == 1) {
-                // Save state after this instruction, so next run starts at pc+1
-                state.pc = pc+1;
+                state.pc = pc + 1;
                 if (save_snapshot(state, args[0])) {
                     std::cout << "Snapshot saved to " << args[0] << std::endl;
                 } else {
                     std::cerr << "Failed to save snapshot: " << args[0] << std::endl;
                 }
             }
-            // Arithmetic, logic, and register instructions (MIPS-style examples)
+            // Arithmetic and other handlers...
+            else if (instr == "DUMP_PROCESSOR_STATE") {
+                dump_processor_state(state.reg);
+            }
             else if (instr == "li" && args.size() == 2) {
                 int idx = reg_index(args[0]);
                 int val = std::stoi(args[1]);
-                if (idx > 0) state.reg[idx] = val; // MIPS $zero ($r0) is always 0
-            } else if (instr == "add" && args.size() == 3) {
+                if (idx > 0) state.reg[idx] = val;
+            } 
+            else if (instr == "add" && args.size() == 3) {
                 int rd = reg_index(args[0]), rs = reg_index(args[1]), rt = reg_index(args[2]);
                 if (rd > 0 && rs >= 0 && rt >= 0)
                     state.reg[rd] = state.reg[rs] + state.reg[rt];
@@ -276,4 +327,3 @@ int main(int argc, char *argv[]) {
     }
     return 0;
 }
-
